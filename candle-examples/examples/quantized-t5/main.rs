@@ -82,7 +82,7 @@ struct T5ModelBuilder {
 
 impl T5ModelBuilder {
     pub fn load(args: &Args) -> Result<(Self, Tokenizer)> {
-        let device = Device::Cpu;
+        let device = Device::new_cuda(0)?;
         let default_model = "lmz/candle-quantized-t5".to_string();
         let (model_id, revision) = match (args.model_id.to_owned(), args.revision.to_owned()) {
             (Some(model_id), Some(revision)) => (model_id, revision),
@@ -132,7 +132,7 @@ impl T5ModelBuilder {
     }
 
     pub fn build_model(&self) -> Result<t5::T5ForConditionalGeneration> {
-        let device = Device::Cpu;
+        let device = Device::new_cuda(0)?;
         let vb = t5::VarBuilder::from_gguf(&self.weights_filename, &device)?;
         Ok(t5::T5ForConditionalGeneration::load(vb, &self.config)?)
     }
