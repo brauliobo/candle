@@ -4,6 +4,7 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 use std::io::Write;
+use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
 
 use candle_transformers::models::quantized_t5 as t5;
@@ -14,6 +15,13 @@ use candle_transformers::generation::LogitsProcessor;
 use clap::{Parser, ValueEnum};
 use hf_hub::{api::sync::Api, api::sync::ApiRepo, Repo, RepoType};
 use tokenizers::Tokenizer;
+
+use axum::{
+    response::IntoResponse,
+    http::StatusCode,
+    Router, Json,
+};
+use serde_json::Value;
 
 #[derive(Clone, Debug, Copy, ValueEnum)]
 enum Which {
@@ -48,10 +56,6 @@ struct Args {
     // Enable/disable decoding.
     #[arg(long, default_value = "false")]
     disable_cache: bool,
-
-    /// Use this prompt, otherwise compute sentence similarities.
-    #[arg(long)]
-    prompt: String,
 
     /// The temperature used to generate samples.
     #[arg(long, default_value_t = 0.8)]
@@ -147,11 +151,17 @@ impl T5ModelBuilder {
     }
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     use tracing_chrome::ChromeLayerBuilder;
     use tracing_subscriber::prelude::*;
 
     let args = Args::parse();
+    let (builder, mut tokenizer) = T5ModelBuilder::load(&args)?;
+    let builder = Arc::new(builder);
+    let device = Arc::clone(&builder).device.clone();
+    let model = builder.build_model()?;
+    let model = Arc::new(Mutex::new(model));
 
     let _guard = if args.tracing {
         let (chrome_layer, guard) = ChromeLayerBuilder::new().build();
@@ -161,73 +171,118 @@ fn main() -> Result<()> {
         None
     };
 
-    let (builder, mut tokenizer) = T5ModelBuilder::load(&args)?;
-    let device = &builder.device;
-    let tokenizer = tokenizer
-        .with_padding(None)
-        .with_truncation(None)
-        .map_err(E::msg)?;
-    let tokens = tokenizer
-        .encode(args.prompt, true)
-        .map_err(E::msg)?
-        .get_ids()
+    fn generate_text(
+        args: &Args,
+        prompt: String,
+        builder: Arc<T5ModelBuilder>,
+        tokenizer: &mut Tokenizer,
+        device: &Device,
+        model: Arc<Mutex<t5::T5ForConditionalGeneration>>,
+    ) -> Result<String, anyhow::Error> {
+        let mut result = String::new();
+        let tokenizer = tokenizer
+            .with_padding(None)
+            .with_truncation(None)
+            .map_err(E::msg)?;
+
+        let tokens = tokenizer
+            .encode(prompt, true)
+            .map_err(E::msg)?
+            .get_ids()
+            .to_vec();
+        let input_token_ids = Tensor::new(&tokens[..], device)?.unsqueeze(0)?;
+        let mut model = model.lock().unwrap();
+        let model = &mut *model;
+        let mut output_token_ids = [builder
+            .config
+            .decoder_start_token_id
+            .unwrap_or(builder.config.pad_token_id) as u32]
         .to_vec();
-    let input_token_ids = Tensor::new(&tokens[..], device)?.unsqueeze(0)?;
-    let mut model = builder.build_model()?;
-    let mut output_token_ids = [builder
-        .config
-        .decoder_start_token_id
-        .unwrap_or(builder.config.pad_token_id) as u32]
-    .to_vec();
-    let temperature = if args.temperature <= 0. {
-        None
-    } else {
-        Some(args.temperature)
-    };
-    let mut logits_processor = LogitsProcessor::new(299792458, temperature, args.top_p);
-    let encoder_output = model.encode(&input_token_ids)?;
-    let start = std::time::Instant::now();
-
-    for index in 0.. {
-        if output_token_ids.len() > 512 {
-            break;
-        }
-        let decoder_token_ids = if index == 0 || !builder.config.use_cache {
-            Tensor::new(output_token_ids.as_slice(), device)?.unsqueeze(0)?
+        let temperature = if args.temperature <= 0. {
+            None
         } else {
-            let last_token = *output_token_ids.last().unwrap();
-            Tensor::new(&[last_token], device)?.unsqueeze(0)?
+            Some(args.temperature)
         };
-        let logits = model
-            .decode(&decoder_token_ids, &encoder_output)?
-            .squeeze(0)?;
-        let logits = if args.repeat_penalty == 1. {
-            logits
-        } else {
-            let start_at = output_token_ids.len().saturating_sub(args.repeat_last_n);
-            candle_transformers::utils::apply_repeat_penalty(
-                &logits,
-                args.repeat_penalty,
-                &output_token_ids[start_at..],
-            )?
-        };
+        let mut logits_processor = LogitsProcessor::new(299792458, temperature, args.top_p);
+        let encoder_output = model.encode(&input_token_ids)?;
+        let start = std::time::Instant::now();
 
-        let next_token_id = logits_processor.sample(&logits)?;
-        if next_token_id as usize == builder.config.eos_token_id {
-            break;
+        for index in 0.. {
+            if output_token_ids.len() > 512 {
+                break;
+            }
+            let decoder_token_ids = if index == 0 || !builder.config.use_cache {
+                Tensor::new(output_token_ids.as_slice(), device)?.unsqueeze(0)?
+            } else {
+                let last_token = *output_token_ids.last().unwrap();
+                Tensor::new(&[last_token], device)?.unsqueeze(0)?
+            };
+            let logits = model
+                .decode(&decoder_token_ids, &encoder_output)?
+                .squeeze(0)?;
+            let logits = if args.repeat_penalty == 1. {
+                logits
+            } else {
+                let start_at = output_token_ids.len().saturating_sub(args.repeat_last_n);
+                candle_transformers::utils::apply_repeat_penalty(
+                    &logits,
+                    args.repeat_penalty,
+                    &output_token_ids[start_at..],
+                )?
+            };
+
+            let next_token_id = logits_processor.sample(&logits)?;
+            if next_token_id as usize == builder.config.eos_token_id {
+                break;
+            }
+            output_token_ids.push(next_token_id);
+            if let Some(text) = tokenizer.id_to_token(next_token_id) {
+                let text = text.replace('▁', " ").replace("<0x0A>", "\n");
+                print!("{text}");
+                result.push_str(&text);
+                std::io::stdout().flush()?;
+            }
         }
-        output_token_ids.push(next_token_id);
-        if let Some(text) = tokenizer.id_to_token(next_token_id) {
-            let text = text.replace('▁', " ").replace("<0x0A>", "\n");
-            print!("{text}");
-            std::io::stdout().flush()?;
-        }
+        let dt = start.elapsed();
+        println!(
+            "\n{} tokens generated ({:.2} token/s)\n",
+            output_token_ids.len(),
+            output_token_ids.len() as f64 / dt.as_secs_f64(),
+        );
+        Ok(result)
     }
-    let dt = start.elapsed();
-    println!(
-        "\n{} tokens generated ({:.2} token/s)\n",
-        output_token_ids.len(),
-        output_token_ids.len() as f64 / dt.as_secs_f64(),
-    );
+
+    // build our application with a single route
+    let app = Router::new().route("/completions", axum::routing::post(move |Json(payload): Json<serde_json::Value>| {
+        let args = args.clone();
+        async move {
+            let builder = Arc::clone(&builder);
+            let device = device.clone();
+            let model = Arc::clone(&model);
+
+             // Extract prompt from the payload
+            let prompt = match payload.get("prompt") { Some(Value::String(s)) => s.clone(), _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "Missing or invalid 'prompt' in request body".to_string(),
+                ).into_response();
+                }
+            };
+
+            match generate_text(&args, prompt, builder, &mut tokenizer, &device, model) {
+                Ok(result) => {
+                    let response = serde_json::json!({ "content": result });
+                    axum::Json(response).into_response()
+                },
+                Err(err) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+            }
+        }
+    }));
+
+    // run our app with hyper, listening globally on port 3000
+    let port     = std::env::var("PORT").unwrap_or_else(|_| "10201".to_string());
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+
     Ok(())
 }
