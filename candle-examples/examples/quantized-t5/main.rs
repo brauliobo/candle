@@ -4,7 +4,7 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 use std::io::Write;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::path::PathBuf;
 
 use candle_transformers::models::quantized_t5 as t5;
@@ -161,7 +161,7 @@ async fn main() -> Result<()> {
     let builder = Arc::new(builder);
     let device = Arc::clone(&builder).device.clone();
     let model = builder.build_model()?;
-    let model = Arc::new(Mutex::new(model));
+    let model = Arc::new(model);
 
     let _guard = if args.tracing {
         let (chrome_layer, guard) = ChromeLayerBuilder::new().build();
@@ -177,7 +177,7 @@ async fn main() -> Result<()> {
         builder: Arc<T5ModelBuilder>,
         tokenizer: &mut Tokenizer,
         device: &Device,
-        model: Arc<Mutex<t5::T5ForConditionalGeneration>>,
+        model: Arc<t5::T5ForConditionalGeneration>,
     ) -> Result<String, anyhow::Error> {
         let mut result = String::new();
         let tokenizer = tokenizer
@@ -191,8 +191,7 @@ async fn main() -> Result<()> {
             .get_ids()
             .to_vec();
         let input_token_ids = Tensor::new(&tokens[..], device)?.unsqueeze(0)?;
-        let mut model = model.lock().unwrap();
-        let model = &mut *model;
+        let mut model = model.as_ref().clone();
         let mut output_token_ids = [builder
             .config
             .decoder_start_token_id
