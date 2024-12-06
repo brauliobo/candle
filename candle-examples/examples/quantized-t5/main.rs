@@ -236,7 +236,11 @@ async fn main() -> Result<()> {
             }
             output_token_ids.push(next_token_id);
             if let Some(text) = tokenizer.id_to_token(next_token_id) {
-                let text = text.replace('▁', " ").replace("<0x0A>", "\n");
+                let text = if result.is_empty() {
+                    text.replace('▁', "").replace("<0x0A>", "\n")
+                } else {
+                    text.replace('▁', " ").replace("<0x0A>", "\n")
+                };
                 print!("{text}");
                 result.push_str(&text);
                 std::io::stdout().flush()?;
