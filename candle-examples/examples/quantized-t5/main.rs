@@ -264,21 +264,31 @@ async fn main() -> Result<()> {
             let model = Arc::clone(&model);
 
              // Extract prompt from the payload
-            let prompt = match payload.get("prompt") { Some(Value::String(s)) => s.clone(), _ => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    "Missing or invalid 'prompt' in request body".to_string(),
-                ).into_response();
-                }
-            };
-
-            match generate_text(&args, prompt, builder, &mut tokenizer, &device, model) {
-                Ok(result) => {
-                    let response = serde_json::json!({ "content": result });
-                    axum::Json(response).into_response()
-                },
-                Err(err) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
-            }
+             let prompts = match payload.get("prompt") {
+                 Some(Value::String(s)) => vec![s.clone()],
+                 Some(Value::Array(arr)) => arr.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+                 _ => {
+                     return (
+                         StatusCode::BAD_REQUEST,
+                         "Missing or invalid 'prompt' in request body".to_string(),
+                     ).into_response();
+                 }
+             };
+             
+             let mut results = Vec::new();
+             for prompt in prompts {
+                 match generate_text(&args, prompt, builder.clone(), &mut tokenizer, &device, model.clone()) {
+                     Ok(result) => results.push(result),
+                     Err(err) => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+                 }
+             }
+             
+             let response = if results.len() == 1 {
+                 serde_json::json!({ "content": results[0] })
+             } else {
+                 serde_json::json!({ "content": results })
+             };
+             axum::Json(response).into_response()
         }
     }));
 
