@@ -58,7 +58,7 @@ struct Args {
     disable_cache: bool,
 
     /// The temperature used to generate samples.
-    #[arg(long, default_value_t = 0.8)]
+    #[arg(long, default_value_t = 0.0)]
     temperature: f64,
 
     /// Nucleus sampling probability cutoff.
