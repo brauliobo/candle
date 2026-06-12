@@ -259,11 +259,35 @@ impl Device {
         Ok(Self::Metal(crate::MetalDevice::new(ordinal)?))
     }
 
+    /// Run `f` with device specific context.
+    ///
+    /// On CPU this installs candle's private rayon thread pool for the
+    /// duration of `f`, keeping worker threads warm across the many short
+    /// parallel sections in a model forward pass. Currently noop for other backends.
+    pub fn with_context<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce() -> R + Send,
+        R: Send,
+    {
+        match self {
+            Self::Cpu => crate::utils::with_threadpool(f),
+            _ => f(),
+        }
+    }
+
     pub fn set_seed(&self, seed: u64) -> Result<()> {
         match self {
             Self::Cpu => CpuDevice.set_seed(seed),
             Self::Cuda(c) => c.set_seed(seed),
             Self::Metal(m) => m.set_seed(seed),
+        }
+    }
+
+    pub fn get_current_seed(&self) -> Result<u64> {
+        match self {
+            Self::Cpu => CpuDevice.get_current_seed(),
+            Self::Cuda(c) => c.get_current_seed(),
+            Self::Metal(m) => m.get_current_seed(),
         }
     }
 
@@ -315,6 +339,14 @@ impl Device {
     pub fn cuda_if_available(ordinal: usize) -> Result<Self> {
         if crate::utils::cuda_is_available() {
             Self::new_cuda(ordinal)
+        } else {
+            Ok(Self::Cpu)
+        }
+    }
+
+    pub fn metal_if_available(ordinal: usize) -> Result<Self> {
+        if crate::utils::metal_is_available() {
+            Self::new_metal(ordinal)
         } else {
             Ok(Self::Cpu)
         }
