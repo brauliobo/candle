@@ -3,9 +3,8 @@ extern crate intel_mkl_src;
 
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
-use std::io::Write;
-use std::sync::Arc;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use candle_transformers::models::quantized_t5 as t5;
 
@@ -16,11 +15,7 @@ use clap::{Parser, ValueEnum};
 use hf_hub::{api::sync::Api, api::sync::ApiRepo, Repo, RepoType};
 use tokenizers::Tokenizer;
 
-use axum::{
-    response::IntoResponse,
-    http::StatusCode,
-    Router, Json,
-};
+use axum::{http::StatusCode, response::IntoResponse, Json, Router};
 use serde_json::Value;
 
 #[derive(Clone, Debug, Copy, ValueEnum)]
@@ -72,6 +67,10 @@ struct Args {
     /// The context size to consider for the repeat penalty.
     #[arg(long, default_value_t = 64)]
     repeat_last_n: usize,
+
+    /// Maximum number of tokens to generate.
+    #[arg(long, default_value_t = 256)]
+    max_tokens: usize,
 
     /// The model size to use.
     #[arg(long, default_value = "t5-small")]
@@ -186,7 +185,7 @@ async fn main() -> Result<()> {
             .map_err(E::msg)?;
 
         let tokens = tokenizer
-            .encode(prompt, true)
+            .encode(prompt.as_str(), true)
             .map_err(E::msg)?
             .get_ids()
             .to_vec();
@@ -207,7 +206,7 @@ async fn main() -> Result<()> {
         let start = std::time::Instant::now();
 
         for index in 0.. {
-            if output_token_ids.len() > 512 {
+            if output_token_ids.len().saturating_sub(1) >= args.max_tokens {
                 break;
             }
             let decoder_token_ids = if index == 0 || !builder.config.use_cache {
@@ -241,60 +240,152 @@ async fn main() -> Result<()> {
                 } else {
                     text.replace('▁', " ").replace("<0x0A>", "\n")
                 };
-                print!("{text}");
                 result.push_str(&text);
-                std::io::stdout().flush()?;
             }
         }
+        let result = safe_generation(&prompt, result);
         let dt = start.elapsed();
         println!(
-            "\n{} tokens generated ({:.2} token/s)\n",
-            output_token_ids.len(),
-            output_token_ids.len() as f64 / dt.as_secs_f64(),
+            "{} tokens generated ({:.2} token/s)",
+            output_token_ids.len().saturating_sub(1),
+            output_token_ids.len().saturating_sub(1) as f64 / dt.as_secs_f64(),
         );
         Ok(result)
     }
 
-    // build our application with a single route
-    let app = Router::new().route("/completions", axum::routing::post(move |Json(payload): Json<serde_json::Value>| {
-        let args = args.clone();
-        async move {
-            let builder = Arc::clone(&builder);
-            let device = device.clone();
-            let model = Arc::clone(&model);
-
-             // Extract prompt from the payload
-             let prompts = match payload.get("prompt") {
-                 Some(Value::String(s)) => vec![s.clone()],
-                 Some(Value::Array(arr)) => arr.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
-                 _ => {
-                     return (
-                         StatusCode::BAD_REQUEST,
-                         "Missing or invalid 'prompt' in request body".to_string(),
-                     ).into_response();
-                 }
-             };
-             
-             let mut results = Vec::new();
-             for prompt in prompts {
-                 match generate_text(&args, prompt, builder.clone(), &mut tokenizer, &device, model.clone()) {
-                     Ok(result) => results.push(result),
-                     Err(err) => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
-                 }
-             }
-             
-             let response = if results.len() == 1 {
-                 serde_json::json!({ "content": results[0] })
-             } else {
-                 serde_json::json!({ "content": results })
-             };
-             axum::Json(response).into_response()
+    fn safe_generation(prompt: &str, output: String) -> String {
+        if valid_translation_output(prompt, &output) {
+            return output.trim().to_string();
         }
-    }));
+
+        println!("invalid generation replaced with source fallback");
+        source_text(prompt)
+    }
+
+    fn source_text(prompt: &str) -> String {
+        let prompt = prompt.trim();
+        let source = if prompt.starts_with("<2") {
+            prompt
+                .split_once('>')
+                .map(|(_, source)| source.trim())
+                .unwrap_or(prompt)
+        } else {
+            prompt
+        };
+
+        strip_artifact_prefix(source)
+    }
+
+    fn strip_artifact_prefix(text: &str) -> String {
+        let mut text = text.trim();
+        loop {
+            let lower = text.to_ascii_lowercase();
+            let Some(marker) = ARTIFACT_MARKERS
+                .iter()
+                .find(|marker| lower.starts_with(**marker))
+            else {
+                break;
+            };
+            text = text[marker.len()..]
+                .trim_start_matches([' ', ':', '='])
+                .trim_start();
+        }
+        text.to_string()
+    }
+
+    const ARTIFACT_MARKERS: [&str; 6] = [
+        "model_input",
+        "attention_mask",
+        "decoder_input_ids",
+        "input_ids",
+        "generated_text",
+        "translation_text",
+    ];
+
+    fn valid_translation_output(prompt: &str, output: &str) -> bool {
+        let cleaned = output.trim();
+        if cleaned.is_empty() {
+            return false;
+        }
+
+        let lower = cleaned.to_ascii_lowercase();
+        if ARTIFACT_MARKERS.iter().any(|marker| lower.contains(marker)) {
+            return false;
+        }
+
+        if prompt.trim_start().starts_with("<2") {
+            let source = source_text(prompt);
+            let max_reasonable_len = (source.chars().count() * 8).max(240);
+            if cleaned.chars().count() > max_reasonable_len {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    // build our application with a single route
+    let app = Router::new().route(
+        "/completions",
+        axum::routing::post(move |Json(payload): Json<serde_json::Value>| {
+            let args = args.clone();
+            async move {
+                let builder = Arc::clone(&builder);
+                let device = device.clone();
+                let model = Arc::clone(&model);
+
+                // Extract prompt from the payload
+                let prompts = match payload.get("prompt") {
+                    Some(Value::String(s)) => vec![s.clone()],
+                    Some(Value::Array(arr)) => arr
+                        .iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect(),
+                    _ => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            "Missing or invalid 'prompt' in request body".to_string(),
+                        )
+                            .into_response();
+                    }
+                };
+
+                let mut results = Vec::new();
+                for prompt in prompts {
+                    match generate_text(
+                        &args,
+                        prompt,
+                        builder.clone(),
+                        &mut tokenizer,
+                        &device,
+                        model.clone(),
+                    ) {
+                        Ok(result) => results.push(result),
+                        Err(err) => {
+                            return (
+                                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                err.to_string(),
+                            )
+                                .into_response()
+                        }
+                    }
+                }
+
+                let response = if results.len() == 1 {
+                    serde_json::json!({ "content": results[0] })
+                } else {
+                    serde_json::json!({ "content": results })
+                };
+                axum::Json(response).into_response()
+            }
+        }),
+    );
 
     // run our app with hyper, listening globally on port 3000
-    let port     = std::env::var("PORT").unwrap_or_else(|_| "10201".to_string());
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await.unwrap();
+    let port = std::env::var("PORT").unwrap_or_else(|_| "10201".to_string());
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
+        .await
+        .unwrap();
     axum::serve(listener, app).await.unwrap();
 
     Ok(())
