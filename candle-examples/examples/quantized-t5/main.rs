@@ -5,6 +5,7 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use candle_transformers::models::quantized_t5 as t5;
 
@@ -83,6 +84,13 @@ struct T5ModelBuilder {
     weights_filename: PathBuf,
 }
 
+struct GenerationState {
+    builder: Arc<T5ModelBuilder>,
+    device: Device,
+    model: Arc<t5::T5ForConditionalGeneration>,
+    tokenizer: Tokenizer,
+}
+
 impl T5ModelBuilder {
     pub fn load(args: &Args) -> Result<(Self, Tokenizer)> {
         let device = Device::new_cuda(0)?;
@@ -156,11 +164,17 @@ async fn main() -> Result<()> {
     use tracing_subscriber::prelude::*;
 
     let args = Args::parse();
-    let (builder, mut tokenizer) = T5ModelBuilder::load(&args)?;
+    let (builder, tokenizer) = T5ModelBuilder::load(&args)?;
     let builder = Arc::new(builder);
     let device = Arc::clone(&builder).device.clone();
     let model = builder.build_model()?;
     let model = Arc::new(model);
+    let state = Arc::new(Mutex::new(GenerationState {
+        builder: Arc::clone(&builder),
+        device,
+        model: Arc::clone(&model),
+        tokenizer,
+    }));
 
     let _guard = if args.tracing {
         let (chrome_layer, guard) = ChromeLayerBuilder::new().build();
@@ -191,6 +205,7 @@ async fn main() -> Result<()> {
             .to_vec();
         let input_token_ids = Tensor::new(&tokens[..], device)?.unsqueeze(0)?;
         let mut model = model.as_ref().clone();
+        model.clear_kv_cache();
         let mut output_token_ids = [builder
             .config
             .decoder_start_token_id
@@ -243,6 +258,8 @@ async fn main() -> Result<()> {
                 result.push_str(&text);
             }
         }
+        model.clear_kv_cache();
+        device.synchronize()?;
         let result = safe_generation(&prompt, result);
         let dt = start.elapsed();
         println!(
@@ -329,11 +346,8 @@ async fn main() -> Result<()> {
         "/completions",
         axum::routing::post(move |Json(payload): Json<serde_json::Value>| {
             let args = args.clone();
+            let state = Arc::clone(&state);
             async move {
-                let builder = Arc::clone(&builder);
-                let device = device.clone();
-                let model = Arc::clone(&model);
-
                 // Extract prompt from the payload
                 let prompts = match payload.get("prompt") {
                     Some(Value::String(s)) => vec![s.clone()],
@@ -351,14 +365,19 @@ async fn main() -> Result<()> {
                 };
 
                 let mut results = Vec::new();
+                // candle CUDA/T5 generation mutates KV caches and is not safe to run concurrently.
+                let mut state = state.lock().await;
                 for prompt in prompts {
+                    let builder = Arc::clone(&state.builder);
+                    let device = state.device.clone();
+                    let model = Arc::clone(&state.model);
                     match generate_text(
                         &args,
                         prompt,
-                        builder.clone(),
-                        &mut tokenizer,
+                        builder,
+                        &mut state.tokenizer,
                         &device,
-                        model.clone(),
+                        model,
                     ) {
                         Ok(result) => results.push(result),
                         Err(err) => {
